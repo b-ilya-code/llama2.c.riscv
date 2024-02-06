@@ -13,6 +13,108 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+
+// ----------------------------------------------------------------------------
+// utilities: time
+
+long time_in_ms() {
+    // return time in milliseconds, for benchmarking the model speed
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
+
+typedef enum { ENCODE, SAMPLE, DECODE, FORWARD, MATMUL, SOFTMAX, RMSNORM, ROPE, MULTIHEAD, SWIGLU, END } func;
+#define NFUNC END
+typedef struct {
+    long nrun_func[NFUNC];
+	long times[NFUNC][100000];
+    long long alltime[NFUNC];
+    long long min[NFUNC];
+    long long median[NFUNC];
+    long long sigma[NFUNC];
+} Stats;
+
+void update_stats(Stats* stats, func f, long ms) {
+	++(stats->nrun_func[f]);
+	stats->times[f][stats->nrun_func[f]-1] = ms;
+
+	stats->alltime[f] += ms;
+	if (ms < stats->min[f])
+		stats->min[f] = ms;
+}
+
+const char* get_name_func(func f) {
+	switch (f)
+	{
+	case ENCODE:
+		return "encode";
+	case DECODE:
+		return "decode";
+	case FORWARD:
+		return "forward";
+	case SAMPLE:
+		return "sample";
+    case SOFTMAX:
+		return "softmax";
+	case MATMUL:
+		return "matmul";
+	case RMSNORM:
+		return "rmsnorm";
+    case ROPE:
+		return "RoPE";
+	case MULTIHEAD:
+		return "multihead";
+	case SWIGLU:
+		return "SwiGLU";
+	default:
+		return "";
+	}
+}
+
+void print_stats(Stats* stats, func f) {
+	printf("%s, all time: %lld ms\n", get_name_func(f), stats->alltime[f]);
+	printf("%s, min time: %lld ms\n", get_name_func(f), stats->min[f]);
+	printf("%s, avg: %f ms\n", get_name_func(f), (double)stats->alltime[f] / stats->nrun_func[f]);
+    printf("%s, median: %f ms\n", get_name_func(f), (double)stats->times[f][(stats->nrun_func[f]-1)/2]);
+	printf("%s, nrun_func: %ld\n", get_name_func(f), stats->nrun_func[f]);
+}
+
+int compare_longs(const void* a, const void* b)
+{
+	int arg1 = *(const long*)a;
+	int arg2 = *(const long*)b;
+
+	if (arg1 < arg2) return -1;
+	if (arg1 > arg2) return 1;
+	return 0;
+}
+
+void update_all_stats(Stats* stats) {
+	for (int i = 0; i < NFUNC; ++i) {
+		qsort(stats->times[i], stats->nrun_func[i], sizeof(long), compare_longs);
+	}
+}
+
+void print_all_stats(Stats* stats) {
+    for(int i = 0; i < NFUNC; ++i) {
+        printf("\n");
+        print_stats(stats, i);
+    }
+}
+
+void reset_all_stats(Stats* stats) {
+    memset(stats->nrun_func, 0, sizeof(stats->nrun_func));
+    memset(stats->alltime, 0, sizeof(stats->alltime));
+    memset(stats->min, 0, sizeof(stats->min));
+    memset(stats->median, 0, sizeof(stats->median));
+	for (int i = 0; i < NFUNC; ++i) {
+		 memset(stats->times[i], 0, sizeof(stats->nrun_func[i]));
+	}
+}
+
+static Stats stats;
+
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -180,6 +282,9 @@ void free_transformer(Transformer* t) {
 // neural net blocks; the dynamics of the Transformer
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
+	long start, end;
+	start = time_in_ms();
+
     // calculate sum of squares
     float ss = 0.0f;
     for (int j = 0; j < size; j++) {
@@ -192,9 +297,15 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
     }
+
+	end = time_in_ms();
+	update_stats(&stats, RMSNORM, end - start);
 }
 
 void softmax(float* x, int size) {
+	long start, end;
+	start = time_in_ms();
+
     // find max value (for numerical stability)
     float max_val = x[0];
     for (int i = 1; i < size; i++) {
@@ -212,9 +323,15 @@ void softmax(float* x, int size) {
     for (int i = 0; i < size; i++) {
         x[i] /= sum;
     }
+
+	end = time_in_ms();
+	update_stats(&stats, SOFTMAX, end - start);
 }
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
+	long start, end;
+	start = time_in_ms();
+
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
@@ -226,9 +343,14 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         }
         xout[i] = val;
     }
+
+	end = time_in_ms();
+	update_stats(&stats, MATMUL, end - start);
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
+    long start, end;
+    start = time_in_ms();
 
     // a few convenience variables
     Config* p = &transformer->config;
@@ -261,6 +383,8 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
+		long start_rope, end_rope;
+		start_rope = time_in_ms();
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
             int head_dim = i % head_size;
@@ -277,7 +401,11 @@ float* forward(Transformer* transformer, int token, int pos) {
                 vec[i+1] = v0 * fci + v1 * fcr;
             }
         }
+		end_rope = time_in_ms();
+		update_stats(&stats, ROPE, end_rope - start_rope);
 
+		long start_multihead, end_multihead;
+		start_multihead = time_in_ms();
         // multihead attention. iterate over all heads
         int h;
         #pragma omp parallel for private(h)
@@ -317,6 +445,8 @@ float* forward(Transformer* transformer, int token, int pos) {
                 }
             }
         }
+		end_multihead = time_in_ms();
+		update_stats(&stats, MULTIHEAD, end_multihead - start_multihead);
 
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
@@ -334,6 +464,8 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
+		long start_swiglu, end_swiglu;
+		start_swiglu = time_in_ms();
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
             float val = s->hb[i];
@@ -343,6 +475,8 @@ float* forward(Transformer* transformer, int token, int pos) {
             val *= s->hb2[i];
             s->hb[i] = val;
         }
+		end_swiglu = time_in_ms();
+		update_stats(&stats, SWIGLU, end_swiglu - start_swiglu);
 
         // final matmul to get the output of the ffn
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
@@ -358,6 +492,10 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     // classifier into logits
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+
+    end = time_in_ms();
+    update_stats(&stats, FORWARD, end - start);
+
     return s->logits;
 }
 
@@ -416,6 +554,9 @@ void free_tokenizer(Tokenizer* t) {
 }
 
 char* decode(Tokenizer* t, int prev_token, int token) {
+    long start, end;
+    start = time_in_ms();
+
     char *piece = t->vocab[token];
     // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
     if (prev_token == 1 && piece[0] == ' ') { piece++; }
@@ -425,6 +566,10 @@ char* decode(Tokenizer* t, int prev_token, int token) {
     if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
         piece = (char*)t->byte_pieces + byte_val * 2;
     }
+
+	end = time_in_ms();
+    update_stats(&stats, DECODE, end - start);
+
     return piece;
 }
 
@@ -450,7 +595,10 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
 }
 
 void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
-    // encode the string text (input) into an upper-bound preallocated tokens[] array
+    long start, end;
+    start = time_in_ms();
+
+		// encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
     if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
 
@@ -568,6 +716,9 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     if (eos) tokens[(*n_tokens)++] = 2;
 
     free(str_buffer);
+
+    end = time_in_ms();
+    update_stats(&stats, ENCODE, end - start);
 }
 
 // ----------------------------------------------------------------------------
@@ -689,6 +840,9 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
 }
 
 int sample(Sampler* sampler, float* logits) {
+    long start, end;
+    start = time_in_ms();
+
     // sample the token given the logits and some hyperparameters
     int next;
     if (sampler->temperature == 0.0f) {
@@ -710,17 +864,11 @@ int sample(Sampler* sampler, float* logits) {
             next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
         }
     }
+
+	end = time_in_ms();
+    update_stats(&stats, SAMPLE, end - start);
+
     return next;
-}
-
-// ----------------------------------------------------------------------------
-// utilities: time
-
-long time_in_ms() {
-    // return time in milliseconds, for benchmarking the model speed
-    struct timespec time;
-    clock_gettime(CLOCK_REALTIME, &time);
-    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
 // ----------------------------------------------------------------------------
@@ -745,7 +893,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;     // position in the sequence
     while (pos < steps) {
-
+        reset_all_stats(&stats);
         // forward the transformer to get logits for the next token
         float* logits = forward(transformer, token, pos);
 
@@ -968,6 +1116,10 @@ int main(int argc, char *argv[]) {
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
+
+	update_all_stats(&stats);
+    print_all_stats(&stats);
+
     return 0;
 }
 #endif
