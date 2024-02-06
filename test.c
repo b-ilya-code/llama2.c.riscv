@@ -90,8 +90,66 @@ int test_rvv()
     return (int)vfmv_f_s_f32m1_f32(val);
 }
 
+
+void test_generate_pikin(char* prompt, char* checkpoint_path, float temperature, int steps, float topp, const char* expected){
+    char *tokenizer_path = "tokenizer.bin";
+    unsigned long long rng_seed = 124; // seed rng with time by default
+
+    // parameter validation/overrides
+    if (temperature < 0.0) temperature = 0.0;
+    if (topp < 0.0 || 1.0 < topp) topp = 0.9;
+    if (steps < 0) steps = 0;
+
+    // build the Transformer via the model .bin file
+    Transformer transformer;
+    build_transformer(&transformer, checkpoint_path);
+    if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
+
+    // build the Tokenizer via the tokenizer .bin file
+    Tokenizer tokenizer;
+    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+
+    // build the Sampler
+    Sampler sampler;
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+
+    // run!
+
+    freopen("output.txt", "wt", stdout);  // redirect output
+    generate(&transformer, &tokenizer, &sampler, prompt, steps);
+    freopen("/dev/tty", "w", stdout);  // resume
+
+    // memory and file handles cleanup
+    free_sampler(&sampler);
+    free_tokenizer(&tokenizer);
+    free_transformer(&transformer);
+
+    // Check
+    FILE* f = fopen("output.txt", "rt");
+    fseek(f, 0, SEEK_END);
+    const size_t sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char output[sz];
+    fread(output, sizeof(char), sz, f);
+    output[sz - 1] = '\0';
+    fclose(f);
+
+    int res = strcmp(expected, output);
+    if (res != 0) {
+        printf("Expected: %s\n\nGenerated: %s\n", expected, output);
+    }
+    assert_eq(res, 0);
+}
+
 int main(int argc, char *argv[]) {
     test_prompt_encodings();
     test_rvv();
+
+    const char* expected = "That was the darkest day of the year. The stars were shining bright in the sky and the birds were singing.\n\
+\"Mommy, why is it so dark?\" asked the little girl, pointing out her finger.\n\
+\"Well, the sun is setting and it will be a beautiful night,\" replied her mom.\n\
+The little girl looked up at the sky and smiled. \"I like it when the sun sets,\" she said.\n\
+\"I know, sweetie. The";
+    test_generate_pikin("That was the darkest day of the year.", "/tmp/stories15M.bin", 0.7f, 100, 0.9f, expected);
     printf("ALL OK\n");
 }
