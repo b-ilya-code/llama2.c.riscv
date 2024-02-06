@@ -91,7 +91,7 @@ int test_rvv()
 }
 
 
-void test_generate_pikin(char* prompt, char* checkpoint_path, float temperature, int steps, float topp, const char* expected){
+void test_generate(char* prompt, char* checkpoint_path, float temperature, int steps, float topp, const char* expected){
     char *tokenizer_path = "tokenizer.bin";
     unsigned long long rng_seed = 124; // seed rng with time by default
 
@@ -141,15 +141,15 @@ void test_generate_pikin(char* prompt, char* checkpoint_path, float temperature,
     assert_eq(res, 0);
 }
 
+void test_generates() {
+    const char* expected = "Hello, dear friend, the 3 year old girl, was walking in the park. She saw a big, beautiful tree and wanted to climb it. She asked her mom, \"Can I climb";
+    test_generate("Hello, dear friend,", "stories15M.bin", 0.42f, 42, 0.42f, expected);
+}
+
 int main(int argc, char *argv[]) {
     test_prompt_encodings();
+    test_generates();
     test_rvv();
 
-    const char* expected = "That was the darkest day of the year. The stars were shining bright in the sky and the birds were singing.\n\
-\"Mommy, why is it so dark?\" asked the little girl, pointing out her finger.\n\
-\"Well, the sun is setting and it will be a beautiful night,\" replied her mom.\n\
-The little girl looked up at the sky and smiled. \"I like it when the sun sets,\" she said.\n\
-\"I know, sweetie. The";
-    test_generate_pikin("That was the darkest day of the year.", "/tmp/stories15M.bin", 0.7f, 100, 0.9f, expected);
     printf("ALL OK\n");
 }
